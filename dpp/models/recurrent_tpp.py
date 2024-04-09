@@ -1,15 +1,50 @@
 import dpp
+import timeit
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from torch.distributions import Categorical
 
+from sklearn.metrics import mean_squared_error
+from math import sqrt
+
 from dpp.data.batch import Batch
 from dpp.utils import diff
-
 import numpy as np
 # from .model_utils import encode_onehot, RefNRIMLP
+
+class LabelSmoothingLoss(nn.Module):
+    """
+    With label smoothing,
+    KL-divergence between q_{smoothed ground truth prob.}(w)
+    and p_{prob. computed by model}(w) is minimized.
+    """
+
+    def __init__(self, label_smoothing, tgt_vocab_size, ignore_index=-100):
+        assert 0.0 < label_smoothing <= 1.0
+        super(LabelSmoothingLoss, self).__init__()
+
+        self.eps = label_smoothing
+        self.num_classes = tgt_vocab_size
+        self.ignore_index = ignore_index
+
+    def forward(self, output, target):
+        """
+        output (FloatTensor): (batch_size) x n_classes
+        target (LongTensor): batch_size
+        """
+
+        non_pad_mask = target.ne(self.ignore_index).float()
+
+        target[target.eq(self.ignore_index)] = 0
+        one_hot = F.one_hot(target, num_classes=self.num_classes).float()
+        one_hot = one_hot * (1 - self.eps) + (1 - one_hot) * self.eps / self.num_classes
+
+        log_prb = F.log_softmax(output, dim=-1)
+        loss = -(one_hot * log_prb).sum(dim=-1)
+        loss = loss * non_pad_mask
+        return loss
 
 class RefNRIMLP(nn.Module):
     """Two-layer fully-connected ELU net with batch norm."""
@@ -53,7 +88,19 @@ class RefNRIMLP(nn.Module):
         else:
             return x
 
+class Predictor(nn.Module):
+    """ Prediction of next event type. """
 
+    def __init__(self, dim, num_types):
+        super().__init__()
+
+        self.linear = nn.Linear(dim, num_types, bias=False)
+        nn.init.xavier_normal_(self.linear.weight)
+
+    def forward(self, data):
+        out = self.linear(data)
+        # out = out * non_pad_mask
+        return out
 
 def encode_onehot(labels):
     classes = set(labels)
@@ -170,12 +217,17 @@ class RecurrentTPP(nn.Module):
         else:
             self.num_features = 1
         self.rnn_type = rnn_type
-        self.context_init = nn.Parameter(torch.zeros(context_size))  # initial state of the RNN
         self.rnn = getattr(nn, rnn_type)(input_size=self.num_features, hidden_size=self.context_size, batch_first=True)
+
+        self.context_init = nn.Parameter(torch.zeros(context_size))  # initial state of the RNN
+        fwd_type = rnn_type
+        self.fwd = getattr(nn, fwd_type)(input_size=self.num_features, hidden_size=self.context_size, batch_first=True)
         self.num_edges = num_edges
+
+
         ##########
         # encoder
-        dropout = 0.0
+        dropout = 0.5
         no_bn = False
         self.factor = True
         self.encoder_hidsiz = encoder_hidsiz
@@ -194,7 +246,7 @@ class RecurrentTPP(nn.Module):
 
         tmp_hidden_size = encoder_hidsiz# self.context_size# 64#256
         num_layers = 1#3
-        num_edges = 2 #self.dimension * (self.dimension-1)
+        num_edges = 3 #self.dimension * (self.dimension-1)
         if num_layers == 1:
             self.fc_out = nn.Linear(tmp_hidden_size, num_edges)
         else:
@@ -204,10 +256,11 @@ class RecurrentTPP(nn.Module):
                 layers.append(nn.ELU(inplace=True))
             layers.append(nn.Linear(tmp_hidden_size, num_edges))
             self.fc_out = nn.Sequential(*layers)
-        self.gumbel_temp = 0.75
+        self.gumbel_temp = 0.5#0.75
+
         ##########
 
-        self.dropout_prob = 0.0
+        self.dropout_prob = 0.5
         self.msg_out_shape = self.context_size
         self.skip_first_edge_type = True
         num_vertex = self.dimension
@@ -221,8 +274,8 @@ class RecurrentTPP(nn.Module):
         # edges[2,1]=0
         # edges[3,0]=0
         # edges[3,1]=0
-        edge_types = 2
-        batch_size = 60
+        edge_types = num_edges
+        # batch_size = 60
         # rel_type = torch.zeros((num_vertex*(num_vertex-1), edge_types))
         # rel_type[0, 1] = 1
         # rel_type[3, 1] = 1
@@ -270,12 +323,30 @@ class RecurrentTPP(nn.Module):
         self.msg_fc2 = nn.ModuleList(
             [nn.Linear(n_hid, n_hid) for _ in range(edge_types)]
         )
+
+        self.out_fc1 = nn.Linear(n_hid, n_hid)
+        self.out_fc2 = nn.Linear(n_hid, n_hid)
+        self.out_fc3 = nn.Linear(n_hid, n_hid)
+
         self.forward_rnn = nn.GRU(encoder_hidsiz, encoder_hidsiz, batch_first=True)
         self.reverse_rnn = nn.GRU(encoder_hidsiz, encoder_hidsiz, batch_first=True)
         out_hidden_size = 2 * encoder_hidsiz
         self.encoder_fc_out = nn.Linear(out_hidden_size, self.num_edges)
         self.prior_fc_out = nn.Linear(encoder_hidsiz, self.num_edges)
         self.encoder_fc_out_v1 = nn.Linear(self.dimension_len*encoder_hidsiz * 2, self.num_edges * self.num_prd)
+
+        self.time_predictor = nn.Linear(n_hid * (self.num_nodes + 1), 1) # vaetpp
+        self.mark_predictor = nn.Linear(n_hid * (self.num_nodes + 1), num_vertex)  # vaetpp
+
+        self.time_predictor_v2 = nn.Linear(n_hid, 1)  # vaetpp
+        self.mark_predictor_v2 = nn.Linear(n_hid, num_vertex)
+
+        self.loss_mark_func = LabelSmoothingLoss(0.1, num_vertex, ignore_index=-1)
+        # self.time_predictor = nn.Linear(n_hid, 1) # rnn
+        # self.time_pred1 = nn.Linear(n_hid * self.num_nodes, 1)
+        self.time_pred1 = nn.Linear(n_hid, 1)
+        self.time_pred2 = nn.Linear(1, 1)
+        self.time_pred3 = nn.Linear(1, 1)
 
         ######
         n_periods = self.num_prd
@@ -313,12 +384,12 @@ class RecurrentTPP(nn.Module):
     def kl_categorical_learned(self, preds, prior_logits):
         log_prior = nn.LogSoftmax(dim=-1)(prior_logits)
         kl_div = preds * (torch.log(preds + 1e-16) - log_prior)
-        if True:#self.normalize_kl:
-            return kl_div.sum(-1).view(preds.size(0), -1).mean(dim=1)
-        elif self.normalize_kl_per_var:
-            return kl_div.sum() / (self.num_vars * preds.size(0))
-        else:
-            return kl_div.view(preds.size(0), -1).sum(dim=1)
+        # if True:#self.normalize_kl:
+        return kl_div.sum(-1).view(preds.size(0), -1).mean(dim=1)
+        # elif self.normalize_kl_per_var:
+        #     return kl_div.sum() / (self.num_vars * preds.size(0))
+        # else:
+        #     return kl_div.view(preds.size(0), -1).sum(dim=1)
 
     def get_features(self, batch: dpp.data.Batch) -> torch.Tensor:
         """
@@ -332,8 +403,9 @@ class RecurrentTPP(nn.Module):
                 shape (batch_size, seq_len, num_features)
 
         """
-        features = torch.log(batch.inter_times + 1e-8).unsqueeze(-1)  # (batch_size, seq_len, 1)
-        features = (features - self.mean_log_inter_time) / self.std_log_inter_time
+        # features = (batch.inter_times + 1e-8).unsqueeze(-1)  # (batch_size, seq_len, 1)
+        features = (batch.inter_times.clamp(1e-10)).unsqueeze(-1)  # (batch_size, seq_len, 1)
+        # features = (features - self.mean_log_inter_time) / self.std_log_inter_time
         if self.num_marks > 1:
             mark_emb = self.mark_embedding(batch.marks)  # (batch_size, seq_len, mark_embedding_size)
             features = torch.cat([features, mark_emb], dim=-1)
@@ -433,6 +505,156 @@ class RecurrentTPP(nn.Module):
             log_p += mark_dist.log_prob(batch.marks)  # (batch_size, seq_len)
         log_p *= batch.mask  # (batch_size, seq_len)
         return log_p.sum(-1) + log_surv_last  # (batch_size,)
+
+    def log_prob_v1(self, batch: dpp.data.Batch) -> torch.Tensor:
+        """Compute log-likelihood for a batch of sequences.
+
+        Args:
+            batch:
+
+        Returns:
+            log_p: shape (batch_size,)
+
+        """
+        features = self.get_features(batch)
+        context = self.get_context(features)
+        # context0 =  context
+        context0 = self.fwd(features)[0]
+        ###
+        # rnn_input = features
+        # time_steps = rnn_input.size(1)
+        # hid_size = self.context_size#150#128
+        # hidden_state = torch.zeros(rnn_input.size(0), hid_size)
+        # hidden_seq = []
+        # for istep in range(time_steps):
+        #     inp_r = self.input_r(rnn_input[:, istep, :])  # .view(inputs.size(0), self.num_vars, -1)
+        #     inp_i = self.input_i(rnn_input[:, istep, :])  # .view(inputs.size(0), self.num_vars, -1)
+        #     inp_n = self.input_n(rnn_input[:, istep, :])  # .view(inputs.size(0), self.num_vars, -1)
+        #     # tmp = self.hidden_r(hidden_state)
+        #     r = torch.sigmoid(inp_r + self.hidden_r(hidden_state))
+        #     i = torch.sigmoid(inp_i + self.hidden_i(hidden_state))
+        #     n = torch.tanh(inp_n + r * self.hidden_h(hidden_state))
+        #     hidden_state = ((1 - i) * n + i * hidden_state)
+        #     hidden_seq.append(hidden_state)
+        # context = torch.stack(hidden_seq, dim=1)
+        batch_size, seq_len, context_size = context.shape
+        context_init = self.context_init[None, None, :].expand(batch_size, 1, -1)  # (batch_size, 1, context_size)
+        # Shift the context by vectors by 1: context embedding after event i is used to predict event i + 1
+        if True:
+            context = context[:, :-1, :]
+        context = torch.cat([context_init, context], dim=1)
+
+        ###
+        inter_time_dist = self.get_inter_time_dist(context)
+        inter_times = batch.inter_times.clamp(1e-10)
+        log_p = inter_time_dist.log_prob(inter_times)  # (batch_size, seq_len)
+
+        # Survival probability of the last interval (from t_N to t_end).
+        # You can comment this section of the code out if you don't want to implement the log_survival_function
+        # for the distribution that you are using. This will make the likelihood computation slightly inaccurate,
+        # but the difference shouldn't be significant if you are working with long sequences.
+        last_event_idx = batch.mask.sum(-1, keepdim=True).long()  # (batch_size, 1)
+        log_surv_all = inter_time_dist.log_survival_function(inter_times)  # (batch_size, seq_len)
+        log_surv_last = torch.gather(log_surv_all, dim=-1, index=last_event_idx).squeeze(-1)  # (batch_size,)
+
+        if self.num_marks > 1:
+            mark_logits = torch.log_softmax(self.mark_linear(context), dim=-1)  # (batch_size, seq_len, num_marks)
+            mark_dist = Categorical(logits=mark_logits)
+            log_p += mark_dist.log_prob(batch.marks)  # (batch_size, seq_len)
+        log_p *= batch.mask  # (batch_size, seq_len)
+
+        # return log_p.sum(-1) + log_surv_last
+
+        pred_mark = self.mark_predictor_v2(context0)
+        true_mark = batch.marks[:, 1:] - 1
+        pred_mark = pred_mark[:, :-1, :]
+
+        prediction = torch.max(pred_mark, dim=-1)[1]
+        correct_num = torch.sum(prediction == true_mark)
+
+        loss_mark = self.loss_mark_func(pred_mark.float(), true_mark)
+        loss_mark = torch.sum(loss_mark)
+        ######################################################
+        pred_time = self.time_predictor_v2(context0)
+        pred_time = pred_time.squeeze_(-1)
+        ##########
+        for iii in range(len(last_event_idx)):
+            inter_times[iii, last_event_idx] = 0
+        inter_times = inter_times.clamp(1e-10)
+
+        # true = inter_times[:, 1:]
+        # pred_time = pred_time[:, :-1]
+        # true = inter_times[:, 1:]
+        # prediction = pred_time[:, :-1]
+
+        # # event time gap prediction
+        # diff = prediction - true
+        # rmse = torch.sum(diff * diff)
+        # pred_time = inter_time_dist.mean
+
+
+        #  inter_times = batch.inter_times.clamp(1e-10)
+
+        # rmse = sqrt(mean_squared_error(pred_time,inter_times))
+        # print('RMSE:',rmse)
+
+
+        diff = pred_time - inter_times
+        tmp = diff * diff
+        rmse = torch.sum(tmp)
+        # rmse = torch.tensor(0)
+
+
+        # ####$$$$
+        # ######################################
+        # features = self.get_features(batch)
+        # context0 = self.fwd(features)[0]
+        # ####
+        # batch_size, seq_len, context_size = context0.shape
+        # context = torch.zeros((batch_size, seq_len, self.num_nodes, context_size))
+        # context = context.view(context.size(0), context.size(1), -1)
+        #
+        # # inter_time_dist = self.get_inter_time_dist(context)
+        # #
+        # inter_times = batch.inter_times.clamp(1e-10)
+        # #
+        # # log_p = inter_time_dist.log_prob(inter_times)  # (batch_size, seq_len)
+        # #
+        # # last_event_idx = batch.mask.sum(-1, keepdim=True).long()  # (batch_size, 1)
+        # # log_surv_all = inter_time_dist.log_survival_function(inter_times)  # (batch_size, seq_len)
+        # # log_surv_last = torch.gather(log_surv_all, dim=-1, index=last_event_idx).squeeze(-1)  # (batch_size,)
+        #
+        # # log_p *= batch.mask  # (batch_size, seq_len)
+        #
+        # #########
+        # context = torch.cat([context, context0], dim=-1)
+        #
+        # # pred_mark = self.mark_predictor(context)
+        # # true_mark = batch.marks[:, 1:] - 1
+        # # pred_mark = pred_mark[:, :-1, :]
+        # #
+        # # prediction = torch.max(pred_mark, dim=-1)[1]
+        # # correct_num = torch.sum(prediction == true_mark)
+        # #
+        # # loss_mark = self.loss_mark_func(pred_mark.float(), true_mark)
+        # # loss_mark = torch.sum(loss_mark)
+        # # ######################################################
+        # pred_time = self.time_predictor(context)
+        # pred_time = pred_time.squeeze_(-1)
+        # ##########
+        # for iii in range(len(last_event_idx)):
+        #     inter_times[iii, last_event_idx] = 0
+        # inter_times = inter_times.clamp(1e-10)
+        #
+        # # true = inter_times[:, 1:]
+        # # prediction = pred_time[:, :-1]
+        #
+        # diff = pred_time - inter_times
+        # tmp = diff * diff
+        # rmse = torch.sum(tmp)
+        # ######$$$
+
+        return log_p.sum(-1) + log_surv_last, rmse, loss_mark, correct_num
 
     def log_prob_multivariate(self, batch: dpp.data.Batch) -> torch.Tensor:
         """Compute log-likelihood for a batch of sequences.
@@ -925,14 +1147,14 @@ class RecurrentTPP(nn.Module):
         log_p *= batch.mask  # (batch_size, seq_len)
         return log_p.sum(-1) + log_surv_last  # (batch_size,)
 
-    def log_prob_with_dynamic_graph_v1(self, batch: dpp.data.Batch,mode, epoch, filename) -> torch.Tensor:
-        ######################################
-        ## shape input
+    def log_prob_with_dynamic_graph_v1(self, batch: dpp.data.Batch, mode, epoch, filename) -> torch.Tensor:
         ######################################
         features = self.get_features(batch)
+        ######################################
         ndim = self.dimension
         numbatch = batch.inter_times.size(0)
         # rnn_input = torch.zeros(batch.inter_times.size(0), ndim, batch.inter_times.size(1))
+        start = timeit.default_timer()
         rnn_input = torch.zeros(batch.inter_times.size(0), ndim, self.dimension_len)
         for ibatch in range(numbatch):
             for i in range(ndim):
@@ -940,28 +1162,32 @@ class RecurrentTPP(nn.Module):
                                   :, ] == i)  # [idx for idx, element in enumerate(mixseq_marks) if mixseq_marks==i]
                 rnn_input[ibatch, i, ind[0]] = batch.inter_times[ibatch, ind[0]]
         # rnn_input = expanded_features
+        # stop = timeit.default_timer()
+        # print('Time: ', stop - start)
+
         ######################################
         ## encoder
         ######################################
         # x = rnn_input.transpose(1, 2).contiguous().view(rnn_input.size(0), rnn_input.size(2), -1)
         # x = rnn_input
         x = rnn_input.unsqueeze(-1)
+
         # New shape: [num_sims, num_atoms, num_timesteps*num_dims]
         x = self.mlp1_v1(x)  # 2-layer ELU net per node
         x = self.node2edge_v1(x)
         x = self.mlp2(x)
-        x_skip = x
-
-        if self.factor:
-            x = self.edge2node_v1(x)
-            x = self.mlp3(x)
-            x = self.node2edge_v1(x)
-            x = torch.cat((x, x_skip), dim=-1)  # Skip connection
-            x = self.mlp4(x)
-        else:
-            x = self.mlp3(x)
-            x = torch.cat((x, x_skip), dim=-1)  # Skip connection
-            x = self.mlp4(x)
+        # x_skip = x
+        #
+        # if self.factor:
+        #     x = self.edge2node_v1(x)
+        #     x = self.mlp3(x)
+        #     x = self.node2edge_v1(x)
+        #     x = torch.cat((x, x_skip), dim=-1)  # Skip connection
+        #     x = self.mlp4(x)
+        # else:
+        #     x = self.mlp3(x)
+        #     x = torch.cat((x, x_skip), dim=-1)  # Skip connection
+        #     x = self.mlp4(x)
 
         old_shape = x.shape
         x = x.contiguous().view(-1, old_shape[2], old_shape[3])
@@ -982,8 +1208,10 @@ class RecurrentTPP(nn.Module):
         posterior_logits = pl.transpose(1, 2).contiguous()
 
         all_edges = torch.zeros(posterior_logits.size())
+
         for istep in range(self.num_prd):
             current_p_logits = posterior_logits[:, istep]
+            # current_p_logits = prior_logits[:, istep]
             old_shape = current_p_logits.shape
             hard_sample = False
             all_edges[:,istep] = gumbel_softmax(
@@ -996,6 +1224,12 @@ class RecurrentTPP(nn.Module):
 
         if epoch%50==00:
             torch.save(all_edges, filename + '-edges-epoch'+str(epoch)+'.pt')
+
+        # stop = timeit.default_timer()
+        # print('Time: ', stop - start)
+
+
+
         # pl = self.encoder_fc_out(combined_x)
         # posterior_logits = pl.view(old_shape[0], old_shape[1], timesteps, self.num_edges).transpose(1, 2).contiguous()
 
@@ -1028,6 +1262,8 @@ class RecurrentTPP(nn.Module):
             # if istep < batch.time_interval_idx.size(1):
             # if torch.sum(batch.time_interval_idx[:, istep]>30):
             #     print('d')
+            # xx = torch.arange(0, batch.size, 1)
+            # yy = batch.time_interval_idx[:, istep]
             edges = all_edges[torch.arange(0, batch.size, 1), batch.time_interval_idx[:, istep], :, :]
 
             # node2edge
@@ -1076,8 +1312,23 @@ class RecurrentTPP(nn.Module):
             n = torch.tanh(inp_n + r * self.hidden_h(agg_msgs))
             hidden_state = ((1 - i) * n + i * hidden_state)
             hidden_seq.append(hidden_state)
+
         context = torch.stack(hidden_seq, dim=1)
+
+        # stop = timeit.default_timer()
+        # print('Time: ', stop - start)
+
+        context0 = self.fwd(features)[0]
         batch_size, seq_len, num_vertex, context_size = context.shape
+        ####
+        # dropout_prob = 0.5
+        # context = context.view(-1,context.size(-1))
+        # pred = F.dropout(F.relu(self.out_fc1(context)), p=dropout_prob)
+        # pred = F.dropout(F.relu(self.out_fc2(pred)), p=dropout_prob)
+        # context = self.out_fc3(pred)
+        # context = context.view(batch_size, seq_len, num_vertex, context_size)
+        ####
+
         context_init = self.context_init[None, None, None, :].expand(batch_size, 1, num_vertex, -1)  # (batch_size, 1, context_size)
         # Shift the context by vectors by 1: context embedding after event i is used to predict event i + 1
         # if True:
@@ -1087,7 +1338,17 @@ class RecurrentTPP(nn.Module):
         context = context.view(context.size(0), context.size(1), -1)
 
         inter_time_dist = self.get_inter_time_dist(context)
+
+        # pred_time = inter_time_dist.sample()
+        # pred_time = self.sample(2,5)
+        # pred_time = inter_time_dist.mean
+        #
         inter_times = batch.inter_times.clamp(1e-10)
+        #
+        # # rmse = sqrt(mean_squared_error(pred_time,inter_times))
+        # # print('RMSE:',rmse)
+        # # print(se)
+
         # supp = torch.zeros(inter_times.size(0), self.dimension_len - inter_times.size(1))
         # augment_mask = torch.cat((batch.mask, supp), 1)
         # inter_times = torch.cat((inter_times, supp), 1)
@@ -1098,12 +1359,230 @@ class RecurrentTPP(nn.Module):
         log_surv_all = inter_time_dist.log_survival_function(inter_times)  # (batch_size, seq_len)
         log_surv_last = torch.gather(log_surv_all, dim=-1, index=last_event_idx).squeeze(-1)  # (batch_size,)
 
-        if self.num_marks > 1:
-            mark_logits = torch.log_softmax(self.mark_linear(context), dim=-1)  # (batch_size, seq_len, num_marks)
-            mark_dist = Categorical(logits=mark_logits)
-            log_p += mark_dist.log_prob(batch.marks)  # (batch_size, seq_len)
+        # if self.num_marks > 1:
+        #     mark_logits = torch.log_softmax(self.mark_linear(context), dim=-1)  # (batch_size, seq_len, num_marks)
+        #     mark_dist = Categorical(logits=mark_logits)
+        #     log_p += mark_dist.log_prob(batch.marks)  # (batch_size, seq_len)
+
         log_p *= batch.mask  # (batch_size, seq_len)
-        return log_p.sum(-1) + log_surv_last + 0.5*loss_kl  # (batch_size,)
+
+        #########
+
+        # pred_time = nn.relu(pred_time)
+        # pred_time = nn.Linear(pred_time,)
+
+        # context0 = features
+        context = torch.cat([context, context0],dim=-1)
+
+        # dropout_prob = 0.5
+        # # pred_time = F.relu(self.time_pred1(context))
+        # # pred = F.dropout(F.relu(self.time_pred1(context)), p=dropout_prob)
+        # # pred = F.dropout(F.relu(self.time_pred2(pred)), p=dropout_prob)
+        # pred_time = self.time_pred3(pred)
+        pred_mark = self.mark_predictor(context)
+        true_mark = batch.marks[:, 1:]-1
+        pred_mark = pred_mark[:, :-1, :]
+
+        prediction = torch.max(pred_mark, dim=-1)[1]
+        correct_num = torch.sum(prediction == true_mark)
+
+        loss_mark = self.loss_mark_func(pred_mark.float(), true_mark)
+        loss_mark = torch.sum(loss_mark)
+        ######################################################
+        pred_time = self.time_predictor(context)
+        pred_time = pred_time.squeeze_(-1)
+        ##########
+        for iii in range(len(last_event_idx)):
+            inter_times[iii,last_event_idx] = 0
+        inter_times = inter_times.clamp(1e-10)
+
+        #true = inter_times[:, 1:]
+        #pred_time = pred_time[:, :-1]
+        true = inter_times[:, 1:]
+        prediction = pred_time[:, :-1]
+
+        # # event time gap prediction
+        # diff = prediction - true
+        # se = torch.sum(diff * diff)
+
+        diff = pred_time - inter_times
+        tmp = diff * diff
+        rmse = torch.sum(tmp)
+
+        return (log_p.sum(-1)  + log_surv_last - 0.25*loss_kl), rmse, loss_mark, correct_num
+
+    def log_prob_with_dynamic_graph_v2(self, batch: dpp.data.Batch, mode) -> torch.Tensor:
+
+        ######################################
+        features = self.get_features(batch)
+
+        # #####################################
+        # ndim = self.dimension
+        # numbatch = batch.inter_times.size(0)
+        #
+        # rnn_input = torch.zeros(batch.inter_times.size(0), ndim, self.dimension_len)
+        # for ibatch in range(numbatch):
+        #     for i in range(ndim):
+        #         ind = torch.where(batch.marks[ibatch,
+        #                           :, ] == i)  # [idx for idx, element in enumerate(mixseq_marks) if mixseq_marks==i]
+        #         rnn_input[ibatch, i, ind[0]] = batch.inter_times[ibatch, ind[0]]
+        #
+        # ######################################
+        # ## encoder
+        # ######################################
+        # x = rnn_input.unsqueeze(-1)
+        # ## New shape: [num_sims, num_atoms, num_timesteps*num_dims]
+        # x = self.mlp1_v1(x)  # 2-layer ELU net per node
+        # x = self.node2edge_v1(x)
+        # x = self.mlp2(x)
+        # # x_skip = x
+        #
+        # # if self.factor:
+        # #     x = self.edge2node_v1(x)
+        # #     x = self.mlp3(x)
+        # #     x = self.node2edge_v1(x)
+        # #     x = torch.cat((x, x_skip), dim=-1)  # Skip connection
+        # #     x = self.mlp4(x)
+        # # else:
+        # #     x = self.mlp3(x)
+        # #     x = torch.cat((x, x_skip), dim=-1)  # Skip connection
+        # #     x = self.mlp4(x)
+        #
+        # old_shape = x.shape
+        # x = x.contiguous().view(-1, old_shape[2], old_shape[3])
+        # x_compressed = self.compressor(x.transpose(1,2)).transpose(1,2)
+        #
+        # forward_x, prior_state = self.forward_rnn(x_compressed)
+        # # timesteps = old_shape[2]
+        # reverse_x = x_compressed.flip(1)
+        # reverse_x, _ = self.reverse_rnn(reverse_x)
+        # reverse_x = reverse_x.flip(1)
+        #
+        # # x: [batch*num_edges, num_timesteps, hidden_size]
+        # prior_logits = self.prior_fc_out(forward_x).view(old_shape[0], old_shape[1], self.num_prd,
+        #                                                  self.num_edges).transpose(1, 2).contiguous()
+        #
+        # combined_x = torch.cat([forward_x, reverse_x], dim=-1)
+        # # reformed_x = combined_x.view(combined_x.size(0),-1)
+        # pl = self.encoder_fc_out(combined_x)
+        # pl = pl.view(old_shape[0],old_shape[1],self.num_prd,self.num_edges)
+        # posterior_logits = pl.transpose(1, 2).contiguous()
+        #
+        # all_edges = torch.zeros(posterior_logits.size())
+        # for istep in range(self.num_prd):
+        #     current_p_logits = posterior_logits[:, istep]
+        #     old_shape = current_p_logits.shape
+        #     hard_sample = False
+        #     all_edges[:,istep] = gumbel_softmax(
+        #         current_p_logits.reshape(-1, 2),
+        #         tau=self.gumbel_temp,
+        #         hard=hard_sample).view(old_shape)
+        #
+        # prob = F.softmax(posterior_logits, dim=-1)
+        # loss_kl = self.kl_categorical_learned(prob, prior_logits)
+        #
+        # time_steps = batch.inter_times.size(1)
+        #
+        # hid_size = self.context_size#150#64 * 2
+        # hidden_state = torch.zeros(rnn_input.size(0), rnn_input.size(1), hid_size)
+        # hidden_seq = []
+        # start_idx = 1
+        #
+        # for istep in range(time_steps):
+        #
+        #     edges = all_edges[torch.arange(0, batch.size, 1), batch.time_interval_idx[:, istep], :, :]
+        #
+        #     receivers = hidden_state[:, self.recv_edges, :]
+        #     senders = hidden_state[:, self.send_edges, :]
+        #
+        #     pre_msg = torch.cat([receivers, senders], dim=-1)
+        #
+        #     all_msgs = torch.zeros(pre_msg.size(0), pre_msg.size(1),
+        #                            self.msg_out_shape)
+        #
+        #     for i in range(start_idx, len(self.msg_fc2)):
+        #         msg = torch.tanh(self.msg_fc1[i](pre_msg))
+        #         msg = F.dropout(msg, p=self.dropout_prob)
+        #         msg = torch.tanh(self.msg_fc2[i](msg))
+        #         msg = msg * edges[:, :, i:i + 1]
+        #         all_msgs += msg# / norm
+        #
+        #     # This step sums all of the messages per node
+        #     agg_msgs = all_msgs.transpose(-2, -1).matmul(self.edge2node_mat).transpose(-2, -1)
+        #     agg_msgs = agg_msgs.contiguous() / (self.num_nodes - 1)  # Average
+        #
+        #     #####
+        #     ins = rnn_input[:, :, istep].unsqueeze(-1)
+        #     inp_r = self.input_r(ins)  # .view(inputs.size(0), self.num_vars, -1)
+        #     inp_i = self.input_i(ins)  # .view(inputs.size(0), self.num_vars, -1)
+        #     inp_n = self.input_n(ins)  # .view(inputs.size(0), self.num_vars, -1)
+        #     # tmp = self.hidden_r(hidden_state)
+        #     r = torch.sigmoid(inp_r + self.hidden_r(agg_msgs))
+        #     i = torch.sigmoid(inp_i + self.hidden_i(agg_msgs))
+        #     n = torch.tanh(inp_n + r * self.hidden_h(agg_msgs))
+        #     hidden_state = ((1 - i) * n + i * hidden_state)
+        #     hidden_seq.append(hidden_state)
+        #
+        # context = torch.stack(hidden_seq, dim=1)
+
+        context0 = self.fwd(features)[0]
+        ####
+        batch_size, seq_len, context_size = context0.shape
+        context = torch.zeros((batch_size, seq_len, self.num_nodes, context_size))
+        context = context.view(context.size(0), context.size(1), -1)
+        ####
+        # batch_size, seq_len, num_vertex, context_size = context.shape
+        # ####
+        #
+        # context_init = self.context_init[None, None, None, :].expand(batch_size, 1, num_vertex, -1)  # (batch_size, 1, context_size)
+        # # Shift the context by vectors by 1: context embedding after event i is used to predict event i + 1
+        # # if True:
+        # context = context[:, :-1, :, :]
+        # context = torch.cat([context_init, context], dim=1)
+        #
+        # context = context.view(context.size(0), context.size(1), -1)
+
+        inter_time_dist = self.get_inter_time_dist(context)
+        #
+        inter_times = batch.inter_times.clamp(1e-10)
+        #
+        log_p = inter_time_dist.log_prob(inter_times)  # (batch_size, seq_len)
+        #
+        last_event_idx = batch.mask.sum(-1, keepdim=True).long()  # (batch_size, 1)
+        log_surv_all = inter_time_dist.log_survival_function(inter_times)  # (batch_size, seq_len)
+        log_surv_last = torch.gather(log_surv_all, dim=-1, index=last_event_idx).squeeze(-1)  # (batch_size,)
+
+        log_p *= batch.mask  # (batch_size, seq_len)
+
+        #########
+        context = torch.cat([context, context0],dim=-1)
+
+        pred_mark = self.mark_predictor(context)
+        true_mark = batch.marks[:, 1:]-1
+        pred_mark = pred_mark[:, :-1, :]
+
+        prediction = torch.max(pred_mark, dim=-1)[1]
+        correct_num = torch.sum(prediction == true_mark)
+
+        loss_mark = self.loss_mark_func(pred_mark.float(), true_mark)
+        loss_mark = torch.sum(loss_mark)
+        ######################################################
+        pred_time = self.time_predictor(context)
+        pred_time = pred_time.squeeze_(-1)
+        ##########
+        for iii in range(len(last_event_idx)):
+            inter_times[iii,last_event_idx] = 0
+        inter_times = inter_times.clamp(1e-10)
+
+        true = inter_times[:, 1:]
+        prediction = pred_time[:, :-1]
+
+        diff = pred_time - inter_times
+        tmp = diff * diff
+        rmse = torch.sum(tmp)
+
+        return (log_p.sum(-1) + log_surv_last - 0.25*loss_kl), rmse, loss_mark, correct_num
+        # return torch.tensor(0, dtype=torch.int8), rmse, loss_mark, correct_num
 
     def sample(self, t_end: float, batch_size: int = 1, context_init: torch.Tensor = None) -> dpp.data.Batch:
         """Generate a batch of sequence from the model.

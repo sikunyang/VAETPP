@@ -45,8 +45,8 @@ def load_dataset_mv(name: str, folder: Union[Path, str] = dataset_dir):
 
     def get_inter_times_uni(seq: dict, ind):
         """Get inter-event times from a sequence."""
-        # temp1 = seq["t_start"]
-        # temp2 = seq["arrival_times"][ind]
+        temp1 = seq["t_start"]
+        temp2 = seq["arrival_times"][ind]
         return np.ediff1d(np.concatenate([[seq["t_start"]], seq["arrival_times"][ind]])) # , [seq["t_end"]]
     def get_inter_times(seq: dict):
         """Get inter-event times from a sequence."""
@@ -56,7 +56,9 @@ def load_dataset_mv(name: str, folder: Union[Path, str] = dataset_dir):
         inter_times = np.zeros((1,len(seq["arrival_times"])+1))
         for d in range(len(np.unique(seq['marks']))):
             ind = np.where(seq['marks'] == d)
-            inter_times[0,ind] = get_inter_times_uni(seq,ind) #  \
+            temp = get_inter_times_uni(seq,ind)
+            temp[np.where(temp == 0)] = 1
+            inter_times[0,ind] = np.log(temp) #  \
         to_end = [seq["t_end"]-seq["arrival_times"][-1]]
         inter_times[0,len(seq["arrival_times"])]=to_end[0]
         # inter_times = np.concatenate([inter_times,to_end[0]])
@@ -65,13 +67,22 @@ def load_dataset_mv(name: str, folder: Union[Path, str] = dataset_dir):
         # return np.ediff1d(np.concatenate([[seq["t_start"]], seq["arrival_times"], [seq["t_end"]]]))
 
     sequences = [
+        # Sequence(
+        #     inter_times= get_inter_times_mv(seq),
+        #     arr_times= seq.get("arrival_times"),
+        #     time_interval_idx=seq.get("time_interval_idx"),
+        #     marks=seq.get("marks"),
+        #     t_start=seq.get("t_start"),
+        #     t_end=seq.get("t_end")
+        # )
         Sequence(
-            inter_times= get_inter_times_mv(seq),
-            arr_times= seq.get("arrival_times"),
+            inter_times=get_inter_times_mv(seq),# /(seq.get("t_end"))*1000),
+            arr_times=seq.get("arrival_times"),#/(seq.get("t_end")/100),
             time_interval_idx=seq.get("time_interval_idx"),
             marks=seq.get("marks"),
             t_start=seq.get("t_start"),
-            t_end=seq.get("t_end")
+            # t_end=100#
+            tend=seq.get("t_end")
         )
         for seq in dataset["sequences"]
     ]

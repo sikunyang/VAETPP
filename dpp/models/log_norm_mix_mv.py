@@ -58,12 +58,21 @@ class LogNormalMixtureDistribution(TransformedDistribution):
         Returns:
             mean: Expected value, shape (batch_size, seq_len)
         """
-        a = self.std_log_inter_time
-        b = self.mean_log_inter_time
+        # a = self.std_log_inter_time
+        # b = self.mean_log_inter_time
+        # loc = self.base_dist._component_distribution.loc
+        # variance = self.base_dist._component_distribution.variance
+        # log_weights = self.base_dist._mixture_distribution.logits
+        # # temp1 = log_weights + a * loc + b + 0.5 * a**2 * variance
+        # # temp2 = temp1.logsumexp(-1)
+        # # temp3 = temp2.clamp(max=50)
+        # # temp4 = temp3.exp()
+        # return (log_weights + a * loc + b + 0.5 * a**2 * variance).logsumexp(-1).clamp(max=4).exp()
         loc = self.base_dist._component_distribution.loc
         variance = self.base_dist._component_distribution.variance
         log_weights = self.base_dist._mixture_distribution.logits
-        return (log_weights + a * loc + b + 0.5 * a**2 * variance).logsumexp(-1).exp()
+        return (log_weights + loc + 0.5 * variance).logsumexp(-1).clamp(max=5).exp()
+        # return (log_weights + loc + 0.5 * variance).logsumexp(-1).exp()
 
 
 class LogNormMixMv(RecurrentTPP):
@@ -116,7 +125,7 @@ class LogNormMixMv(RecurrentTPP):
         self.dimension_len = dimension_len
         self.num_mix_components = num_mix_components
         self.linear = nn.Linear(self.context_size*self.num_nodes, 3 * self.num_mix_components)
-        self.num_edges = 2
+        self.num_edges = num_edges
         # self.linear = nn.Linear(self.context_size, 3 * self.num_mix_components)
 
     def get_inter_time_dist(self, context: torch.Tensor) -> torch.distributions.Distribution:
